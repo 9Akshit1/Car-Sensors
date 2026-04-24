@@ -43,6 +43,12 @@ CALIBRATION_FRAMES = 60   # more frames = steadier average bias
 CALIBRATION_FILE   = "calibration/calibration_ref_transformationM.npz"
 CALIBRATION_LOG    = "calibration/calibration_log_transformationM.json"
 
+# Create calibration folder if it doesn't exist
+calibration_dir = "calibration"
+if not os.path.exists(calibration_dir):
+    os.makedirs(calibration_dir)
+    print(f"Created folder: {calibration_dir}")
+
 PROB_EMA_ALPHA = 0.55
 HOLD_FRAMES    = 2
 
