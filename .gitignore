@@ -1,0 +1,21 @@
+# virtual environments
+venv/
+mediapipe_env/
+
+# python cache
+__pycache__/
+
+# compiled libs
+*.dll
+*.pyd
+
+# videos
+Vid/
+*.mp4
+
+# calibration
+classify_live_translationM.py
+calibration_log_transformationM.json
+calibration_log_translationM.json
+calibration_ref_transformationM.npz
+calibration_ref_translationM.npz
