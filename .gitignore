@@ -14,6 +14,7 @@ Vid/
 *.mp4
 
 # calibration
+classify_live_transformationM.py
 classify_live_translationM.py
 calibration_log_transformationM.json
 calibration_log_translationM.json

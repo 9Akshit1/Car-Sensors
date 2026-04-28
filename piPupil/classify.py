@@ -3,13 +3,12 @@ import mediapipe as mp
 import numpy as np
 from joblib import load
 import os
-import json
-import datetime
 
+
+CAMERA_ID = 1    #change if needed
+OUTPUT_SIZE = 300
 IS_DISPLAY = True
 IS_WRITE = False
-CAMERA_ID = 0
-OUTPUT_SIZE = 300
 SHOW_NORM_VIEW = True
 
 LABEL_MAP = {0: "Front", 1: "Left", 2: "Right", 3: "Phone"}
@@ -24,7 +23,24 @@ MODEL_FILES = [
     "Models/Neural_Network.pkl",
 ]
 
-# selected face landmarks for the model
+CALIBRATION_FILE = "calibration/calibration_ref_transformationM.npz"
+
+# smoothing
+PROB_EMA_ALPHA = 0.55
+HOLD_FRAMES = 2
+_IRIS_LM = frozenset(range(468, 478))
+_EYELID_LM = frozenset({145, 159, 160, 161, 374, 380, 385, 386, 387, 388})
+
+# Eye aspect ratio
+_EAR_LEFT = (33, 160, 158, 133, 153, 145)
+_EAR_RIGHT = (263, 387, 385, 362, 380, 374)
+EAR_OPEN_THRESHOLD = 0.23
+EAR_CLOSED_THRESHOLD = 0.15
+
+_ALPHA_BASE = 0.60
+_ALPHA_EYELID = 0.40
+_ALPHA_IRIS = 0.20
+
 SELECTED_LANDMARKS = [
     0, 1, 2, 2, 4, 5, 10, 17, 33, 37, 39, 40, 54,
     61, 67, 84, 91, 94, 97, 98, 132, 133, 145,
@@ -36,33 +52,8 @@ SELECTED_LANDMARKS = [
     471, 472, 473, 474, 475, 476, 477,
 ]
 
-LEFT_EYE_OUTER = 33
-RIGHT_EYE_OUTER = 263
 NOSE_TIP = 4
 
-CALIBRATION_FRAMES = 60
-CALIBRATION_FILE = "calibration/calibration_ref_transformationM.npz"
-CALIBRATION_LOG = "calibration/calibration_log_transformationM.json"
-
-if not os.path.exists("calibration"):
-    os.makedirs("calibration")
-
-# smoothing
-PROB_EMA_ALPHA = 0.55
-HOLD_FRAMES = 2
-_IRIS_LM = frozenset(range(468, 478))
-_EYELID_LM = frozenset({145, 159, 160, 161, 374, 380, 385, 386, 387, 388})
-
-# Eye aspect ratio (EAR)
-_EAR_LEFT = (33, 160, 158, 133, 153, 145)
-_EAR_RIGHT = (263, 387, 385, 362, 380, 374)
-EAR_OPEN_THRESHOLD = 0.23
-EAR_CLOSED_THRESHOLD = 0.15
-
-# per-slot alpha for landmark smoothing (handles iris specially)
-_ALPHA_BASE = 0.60
-_ALPHA_EYELID = 0.40
-_ALPHA_IRIS = 0.20
 _PER_SLOT_ALPHA = np.array(
     [(_ALPHA_IRIS if lm in _IRIS_LM else
       _ALPHA_EYELID if lm in _EYELID_LM else
@@ -72,18 +63,9 @@ _PER_SLOT_ALPHA = np.array(
     dtype=np.float32
 )
 
-# 3D model points for head pose (solvePnP)
-_3D_MODEL_POINTS = np.array([
-    [0.0, 0.0, 0.0],
-    [0.0, -330.0, -65.0],
-    [-225.0, 170.0, -135.0],
-    [225.0, 170.0, -135.0],
-    [-150.0, -150.0, -125.0],
-    [150.0, -150.0, -125.0],
-], dtype=np.float64)
-_MODEL_LM_IDS = [4, 152, 33, 263, 61, 291]
+_L_IRIS_RING = [468, 469, 470, 471, 472]
+_R_IRIS_RING = [473, 474, 475, 476, 477]
 
-# MEDIAPIPE SETUP
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
@@ -96,21 +78,18 @@ face_mesh = mp_face_mesh.FaceMesh(
     refine_landmarks=True,
 )
 
-#---------------------------------------------------------------------
+
 def extract_raw(face_landmarks):
-    # get (478, 2) raw x,y coords from mediapipe
     return np.array([(lm.x, lm.y) for lm in face_landmarks.landmark],
                     dtype=np.float32)
 
 
 def extract_raw_3d(face_landmarks):
-    # get (478, 3) with depth
     return np.array([(lm.x, lm.y, lm.z) for lm in face_landmarks.landmark],
                     dtype=np.float32)
 
 
 def compute_ear(lm):
-    # eye aspect ratio - averaged over both eyes
     def ear_one(p1, p2, p3, p4, p5, p6):
         A = np.linalg.norm(lm[p2] - lm[p6])
         B = np.linalg.norm(lm[p3] - lm[p5])
@@ -120,9 +99,6 @@ def compute_ear(lm):
 
 
 class LandmarkSmoother:
-    # smooths the 146-dim feature vector using per-region EMA alphas
-    # iris landmarks get heavier smoothing when eye is closed (extrapolation is noisy)
-    
     def __init__(self):
         self._smooth = None
     
@@ -134,7 +110,6 @@ class LandmarkSmoother:
         alphas = _PER_SLOT_ALPHA.copy()
         
         if ear < EAR_CLOSED_THRESHOLD:
-            # blink - freeze iris completely
             alphas = np.where(
                 np.array([lm in _IRIS_LM
                            for lm in SELECTED_LANDMARKS
@@ -142,7 +117,6 @@ class LandmarkSmoother:
                 0.0, alphas
             ).astype(np.float32)
         elif ear < EAR_OPEN_THRESHOLD:
-            # partially closed eye - reduce iris alpha
             t = (ear - EAR_CLOSED_THRESHOLD) / (EAR_OPEN_THRESHOLD - EAR_CLOSED_THRESHOLD)
             reduced = _ALPHA_IRIS * t
             alphas = np.where(
@@ -152,7 +126,6 @@ class LandmarkSmoother:
                 reduced, alphas
             ).astype(np.float32)
         
-        # EMA: smooth = alpha * new + (1-alpha) * prev
         self._smooth = alphas * flat_146 + (1.0 - alphas) * self._smooth
         return self._smooth
     
@@ -161,9 +134,6 @@ class LandmarkSmoother:
 
 
 class GazeNormalizer3D:
-    # calibrates 3D transformation (rotation R + translation t) between camera positions
-    # uses SVD to find rigid alignment, then applies to correct landmark positions
-    
     def __init__(self):
         self.ref_3d = None
         self.R = None
@@ -171,111 +141,13 @@ class GazeNormalizer3D:
         self.has_ref = False
         self.has_bias = False
     
-    def calibrate_reference(self, raw_frames_3d):
-        # step 1: capture reference at training position
-        stacked = np.stack(raw_frames_3d, axis=0)
-        self.ref_3d = stacked.mean(axis=0).astype(np.float32)
-        self.has_ref = True
-        self.has_bias = False
-        self.R = None
-        self.t = None
-        
-        std = float(stacked.std(axis=0).mean())
-        print(f"\nReference saved as {CALIBRATION_FILE}")
-        return std
-    
-    def calibrate_position(self, raw_frames_3d):
-        # step 2: capture at new camera position, compute rotation + translation
-        if not self.has_ref:
-            print("  ERROR: complete Step 1 first.")
-            return False
-        
-        stacked = np.stack(raw_frames_3d, axis=0)
-        cur_3d = stacked.mean(axis=0).astype(np.float32)
-        
-        # SVD-based rigid alignment: find R, t such that ref_3d ≈ R @ cur_3d.T + t
-        cur_center = cur_3d.mean(axis=0, keepdims=True)
-        ref_center = self.ref_3d.mean(axis=0, keepdims=True)
-        
-        cur_centered = cur_3d - cur_center
-        ref_centered = self.ref_3d - ref_center
-        
-        # compute covariance
-        H = cur_centered.T @ ref_centered
-        U, S, Vt = np.linalg.svd(H)
-        
-        # rotation matrix (ensure det = +1 for proper orientation)
-        R = Vt.T @ U.T
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-        
-        # translation vector
-        t = (ref_center.T - R @ cur_center.T).reshape(3, 1)
-        
-        self.R = R.astype(np.float32)
-        self.t = t.astype(np.float32)
-        self.has_bias = True
-        
-        std = float(stacked.std(axis=0).mean())
-        
-        angles_rad = self._euler_from_rotation(self.R)
-        angles_deg = np.degrees(angles_rad)
-        trans_mag = float(np.linalg.norm(self.t))
-        
-        print(f"\ncalculated rotation (deg): pitch={angles_deg[0]:.2f}° roll={angles_deg[1]:.2f}° yaw={angles_deg[2]:.2f}°")
-        print(f"calculated translation   : {trans_mag:.4f}")
-        print(f"Saved as {CALIBRATION_FILE}")
-        print(f"\n3D transformation calibration done. Detection should be live!")
-        
-        self._log({
-            "step": "position_bias_3d",
-            "timestamp": datetime.datetime.now().isoformat(),
-            "n_frames": len(raw_frames_3d),
-            "stability_std": std,
-            "rotation_pitch_deg": float(angles_deg[0]),
-            "rotation_roll_deg": float(angles_deg[1]),
-            "rotation_yaw_deg": float(angles_deg[2]),
-            "translation_magnitude": trans_mag,
-        })
-        return True
-    
-    @staticmethod
-    def _euler_from_rotation(R):
-        # extract pitch, roll, yaw from rotation matrix
-        sin_pitch = np.clip(R[2, 0], -1.0, 1.0)
-        pitch = np.arcsin(sin_pitch)
-        
-        cos_pitch = np.cos(pitch)
-        if np.abs(cos_pitch) > 1e-6:
-            roll = np.arctan2(R[2, 1], R[2, 2])
-            yaw = np.arctan2(R[1, 0], R[0, 0])
-        else:
-            # gimbal lock case
-            roll = 0.0
-            yaw = np.arctan2(-R[0, 1], R[1, 1])
-        
-        return np.array([pitch, roll, yaw], dtype=np.float32)
-    
     def apply(self, raw_478x3):
-        # apply 3D rotation + translation, project to 2D
         if self.has_bias and self.R is not None and self.t is not None:
             corrected_3d = (self.R @ raw_478x3.T + self.t).T
         else:
             corrected_3d = raw_478x3
         
         return corrected_3d[:, :2].astype(np.float32)
-    
-    def save(self, path):
-        if not self.has_ref:
-            print("  Nothing to save (no reference yet).")
-            return
-        d = {"ref_3d": self.ref_3d}
-        if self.has_bias and self.R is not None and self.t is not None:
-            d["R"] = self.R
-            d["t"] = self.t
-        np.savez(path, **d)
-        print(f"  Saved → {path}")
     
     def load(self, path):
         try:
@@ -286,35 +158,16 @@ class GazeNormalizer3D:
                 self.R = d["R"].astype(np.float32)
                 self.t = d["t"].astype(np.float32)
                 self.has_bias = True
-                print(f"  Loaded reference + transformation ← {path}")
+                print(f"Loaded reference + transformation ← {path}")
             else:
-                print(f"  Loaded reference (no transformation yet) ← {path}")
+                print(f"Loaded reference (no transformation yet) ← {path}")
             return True
         except Exception as e:
-            print(f"  Could not load {path}: {e}")
+            print(f"Could not load {path}: {e}")
             return False
-    
-    def reset_bias(self):
-        self.R = None
-        self.t = None
-        self.has_bias = False
-    
-    def _log(self, entry):
-        log = []
-        if os.path.exists(CALIBRATION_LOG):
-            try:
-                with open(CALIBRATION_LOG) as f:
-                    log = json.load(f)
-            except:
-                pass
-        log.append(entry)
-        with open(CALIBRATION_LOG, "w") as f:
-            json.dump(log, f, indent=2)
 
 
 class PredictionSmoother:
-    # applies EMA to class probabilities + hysteresis to avoid oscillation
-    
     def __init__(self, n_classes=4, alpha=PROB_EMA_ALPHA, hold=HOLD_FRAMES):
         self.alpha = alpha
         self.hold = hold
@@ -355,9 +208,7 @@ class PredictionSmoother:
         self.count = 0
 
 
-
 def run_models(features_478x2, models, smoothed_flat=None):
-    # run both models and average probabilities
     if smoothed_flat is not None:
         flat = smoothed_flat.reshape(1, -1)
     else:
@@ -368,36 +219,16 @@ def run_models(features_478x2, models, smoothed_flat=None):
         try:
             probs.append(m.predict_proba(flat)[0])
         except Exception as e:
-            print(f"  Model error: {e}")
+            print(f"Model error: {e}")
     
     return np.mean(probs, axis=0) if probs else np.ones(4) / 4.0
 
-_L_IRIS_CTR = 468
-_R_IRIS_CTR = 473
-_L_IRIS_RING = [468, 469, 470, 471, 472]
-_R_IRIS_RING = [473, 474, 475, 476, 477]
-_L_EYE_OUTER = 33
-_L_EYE_INNER = 133
-_R_EYE_OUTER = 263
-_R_EYE_INNER = 362
-_EYEBALL_LEFT = np.array([[29.05], [32.7], [-39.5]], dtype=np.float64)
-_EYEBALL_RIGHT = np.array([[-29.05], [32.7], [-39.5]], dtype=np.float64)
 
-def _make_camera_matrix(w, h):
-    f = float(w)
-    return np.array([[f, 0, w/2.0],
-                     [0, f, h/2.0],
-                     [0, 0, 1.0]], dtype=np.float64)
-
-
-
-def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear, canvas_size=300):
-    # side-by-side view: raw landmarks vs corrected landmarks with 3D gaze rays
+def draw_debug_view(raw_478x2, corrected_478x2, label, has_bias, ear, canvas_size=300):
     half = canvas_size // 2
     canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
     
     def draw_half(pts_478x2, x_off, header, dot_clr):
-        # map coords to pixels on this half
         mn, mx = pts_478x2.min(axis=0), pts_478x2.max(axis=0)
         rng = np.maximum(mx - mn, 1e-9)
         margin = 16
@@ -408,7 +239,6 @@ def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear
         
         all_px = np.array([to_px(i) for i in range(len(pts_478x2))], dtype=np.int32)
         
-        # landmark cloud
         for x, y in all_px:
             if 0 <= x < canvas_size and 0 <= y < canvas_size:
                 cv2.circle(canvas, (x, y), 1, (45, 45, 45), -1)
@@ -418,12 +248,10 @@ def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear
             if 0 <= x < canvas_size and 0 <= y < canvas_size:
                 cv2.circle(canvas, (x, y), 2, dot_clr, -1)
         
-        # nose tip
         nx, ny = all_px[NOSE_TIP]
         if 0 <= nx < canvas_size and 0 <= ny < canvas_size:
             cv2.circle(canvas, (nx, ny), 3, (0, 220, 220), -1)
         
-        # iris circles
         iris_clr_l = (200, 0, 200)
         iris_clr_r = (0, 200, 200)
         for ring, clr in [(_L_IRIS_RING, iris_clr_l), (_R_IRIS_RING, iris_clr_r)]:
@@ -434,7 +262,6 @@ def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear
                 cv2.circle(canvas, tuple(ctr), radius, clr, 1)
                 cv2.circle(canvas, tuple(ctr), 2, clr, -1)
         
-        # header
         cv2.putText(canvas, header,
                     (x_off + 2, canvas_size - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.26, (130, 130, 130), 1)
@@ -442,10 +269,8 @@ def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear
     draw_half(raw_478x2, 0, "RAW", (160, 80, 0))
     draw_half(corrected_478x2, half, "CORRECTED", (0, 160, 220))
     
-    # center divider
     cv2.line(canvas, (half, 0), (half, canvas_size), (70, 70, 70), 1)
     
-    # top label
     direction = LABEL_MAP.get(label, "?")
     clr = LABEL_COLORS.get(direction, (255, 255, 255))
     cv2.putText(canvas, direction,
@@ -456,7 +281,6 @@ def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear
                     (half + 4, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.26,
                     (100, 100, 200), 1)
     
-    # legend
     cv2.putText(canvas, "magenta=L  cyan=R",
                 (2, canvas_size - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.25, (120, 120, 120), 1)
@@ -464,9 +288,7 @@ def draw_debug_view(raw_478x2, corrected_478x2, label, confidence, has_bias, ear
     return canvas
 
 
-# MAIN
 def main():
-    # load models
     models = []
     for path in MODEL_FILES:
         try:
@@ -486,22 +308,17 @@ def main():
     
     ref_loaded = norm.load(CALIBRATION_FILE)
     
-    # camera
     cam = cv2.VideoCapture(CAMERA_ID)
     if not cam.isOpened():
         print("Error: could not open camera.")
         return
     print("Camera opened\n")
     
-    # state
-    cal_buf = []
     label = 0
     raw_probs = np.ones(4) / 4.0
-    cal_step = 1 if ref_loaded else 0
     
-    # instructions
     print("DRIVER GAZE DETECTION")
-    print("F=calibrate | R=reset bias | S=save | D=debug view | Q=quit")
+    print("D=debug view | Q=quit")
     print()
     
     while True:
@@ -511,7 +328,6 @@ def main():
         
         frame = cv2.flip(frame, 1)
         
-        # crop center 300x300
         h, w = frame.shape[:2]
         cy, cx = h // 2, w // 2
         frame = frame[cy-150:cy+150, cx-150:cx+150]
@@ -530,52 +346,16 @@ def main():
             raw = extract_raw(fl)
             raw_3d = extract_raw_3d(fl)
             
-            # calibration
-            if key in (ord("f"), ord("F")):
-                cal_buf.append(raw_3d.copy())
-                n = len(cal_buf)
-                step_lbl = "(reference)" if cal_step == 0 else "(bias)"
-                print(f"Calibrating {step_lbl} ... {n}/{CALIBRATION_FRAMES}", end="\r")
-                
-                if n >= CALIBRATION_FRAMES:
-                    if cal_step == 0:
-                        norm.calibrate_reference(cal_buf)
-                        norm.save(CALIBRATION_FILE)
-                        print(f"\nReference saved as {CALIBRATION_FILE}")
-                        print("Move camera to new position and hold F to calibrate bias\n")
-                        cal_step = 1
-                    else:
-                        ok = norm.calibrate_position(cal_buf)
-                        if ok:
-                            norm.save(CALIBRATION_FILE)
-                    
-                    smoother.reset()
-                    lm_smooth.reset()
-                    cal_buf.clear()
-            
-            if key in (ord("s"), ord("S")):
-                norm.save(CALIBRATION_FILE)
-            
-            if key in (ord("r"), ord("R")):
-                norm.reset_bias()
-                smoother.reset()
-                lm_smooth.reset()
-                cal_step = 1
-                print("\nBias reset. Hold F to re-calibrate.\n")
-            
-            # process frame
             corrected = norm.apply(raw_3d)
             ear = compute_ear(raw)
             raw_flat = corrected[SELECTED_LANDMARKS].flatten().astype(np.float32)
             smooth_flat = lm_smooth.update(raw_flat, ear)
             raw_probs = run_models(corrected, models, smoothed_flat=smooth_flat)
             
-            # flip labels (frame is mirrored)
             raw_probs[1], raw_probs[2] = raw_probs[2].copy(), raw_probs[1].copy()
             
             label = smoother.update(raw_probs)
             
-            # display
             if IS_DISPLAY:
                 disp = frame.copy()
                 
@@ -593,33 +373,23 @@ def main():
                 cv2.putText(disp, direction, (10, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.95, clr, 2)
                 
-                # status bar
                 if norm.has_bias:
-                    s_txt = "CALIBRATED — per-landmark bias correction active"
+                    s_txt = "CALIBRATED — bias correction active"
                     s_clr = (0, 220, 0)
                 elif norm.has_ref:
-                    s_txt = "REF ONLY — hold F to calibrate camera position bias"
+                    s_txt = "REF ONLY — awaiting bias calibration"
                     s_clr = (0, 200, 255)
                 else:
-                    s_txt = "NO REF — hold F (training position, look straight ahead)"
+                    s_txt = "NO CALIBRATION — run calibrate_gaze.py first"
                     s_clr = (80, 80, 255)
                 cv2.putText(disp, s_txt, (4, OUTPUT_SIZE - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.27, s_clr, 1)
                 
-                # calibration progress
-                if cal_buf:
-                    pct = len(cal_buf) / CALIBRATION_FRAMES
-                    cv2.rectangle(disp, (0, OUTPUT_SIZE - 5),
-                                  (int(OUTPUT_SIZE * pct), OUTPUT_SIZE),
-                                  (0, 255, 255), -1)
-                
                 cv2.imshow("Driver Gaze Detection", disp)
                 
-                # debug view
                 if show_norm:
                     dbg = draw_debug_view(
-                        raw, corrected, label, smoother.confidence,
-                        norm.has_bias, ear, OUTPUT_SIZE)
+                        raw, corrected, label, norm.has_bias, ear, OUTPUT_SIZE)
                     cv2.imshow("Debug View", dbg)
         
         else:
@@ -630,9 +400,7 @@ def main():
                 cv2.imshow("Driver Gaze Detection", disp)
         
         if IS_WRITE and results.multi_face_landmarks:
-            print(f"  {LABEL_MAP[label]:6s}  conf:{smoother.confidence:.2f}"
-                  f"  F:{raw_probs[0]:.2f} L:{raw_probs[1]:.2f}"
-                  f"  R:{raw_probs[2]:.2f} P:{raw_probs[3]:.2f}")
+            print(f"{LABEL_MAP[label]:6s}  {label}")
         
         if key == ord("q"):
             print("\nQuitting...")

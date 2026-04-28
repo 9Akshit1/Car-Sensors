@@ -25,13 +25,9 @@ Ensure your USB camera is plugged in before starting the script.
 # 1. Navigate to the project folder
 cd piPupil
 
-# 2. Run the file
-python classify_live_transformationM.py
+# 2. Run the calibration file (only once needed to set the first reference and the first biased calibration). If the camera position changes, then make sure to recalibrate the bias
+python calibrate.py
+
+# 3. Run the classification file (it uses the stored files in calibration created by calibrate.py)
+python classify.py
 ```
-
-### Configuration
-You can modify the following variables inside `classify_live_transformationM.py` to suit your setup:
-
-* **`CAMERA_ID`**: The script defaults to `1`. Change this to `0` or `2` if your webcam doesn't open immediately.
-* **`IS_DISPLAY`**: Set to `False` for headless operation. This is highly recommended for performance when running on the **Raspberry Pi 5**.
-* **`MODEL_FILES`**: Paths to the `.pkl` models used for classification (e.g., `Models/Cubic_SVM.pkl`).
