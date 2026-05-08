@@ -8,7 +8,7 @@ import datetime
 
 IS_DISPLAY = True
 IS_WRITE = False
-CAMERA_ID = 0
+CAMERA_ID = 1
 OUTPUT_SIZE = 300
 SHOW_NORM_VIEW = True
 
@@ -120,9 +120,6 @@ def compute_ear(lm):
 
 
 class LandmarkSmoother:
-    # smooths the 146-dim feature vector using per-region EMA alphas
-    # iris landmarks get heavier smoothing when eye is closed (extrapolation is noisy)
-    
     def __init__(self):
         self._smooth = None
     
@@ -161,9 +158,6 @@ class LandmarkSmoother:
 
 
 class GazeNormalizer3D:
-    # calibrates 3D transformation (rotation R + translation t) between camera positions
-    # uses SVD to find rigid alignment, then applies to correct landmark positions
-    
     def __init__(self):
         self.ref_3d = None
         self.R = None
@@ -313,8 +307,6 @@ class GazeNormalizer3D:
 
 
 class PredictionSmoother:
-    # applies EMA to class probabilities + hysteresis to avoid oscillation
-    
     def __init__(self, n_classes=4, alpha=PROB_EMA_ALPHA, hold=HOLD_FRAMES):
         self.alpha = alpha
         self.hold = hold
