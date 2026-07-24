@@ -31,3 +31,7 @@ python calibrate.py
 # 3. Run the classification file (it uses the stored files in calibration created by calibrate.py)
 python classify.py
 ```
+
+## Computation Efficiency (classify.py)
+- Set IS_DISPLAY=False / SHOW_NORM_VIEW=False for actual deployment runs — those are debug visuals, not part of classification.
+- If the landmark visualization is not needed, then comment out draw_landmarks (or draw a sparse subset like just SELECTED_LANDMARKS instead of the full tesselation).
